@@ -1,24 +1,33 @@
-# app/controllers/reservas_controller.py - VERSIÓN COMPLETA
+# app/controllers/reservas_controller.py - VERSIÓN MEJORADA CON NUEVAS FUNCIONALIDADES
 """
-Controlador de Reservas - Convertido de Django views a Flask
-Gestión de reservas de áreas comunes
+Controlador de Reservas Mejorado - Optimizado para uso móvil
+Nuevas rutas:
+- Sistema de notificaciones
+- Calificaciones de áreas
+- Check-in/Check-out
+- API endpoints para móvil
 """
 
 from flask import Blueprint, render_template, request, redirect, url_for, flash, jsonify
 from flask_login import login_required, current_user
 from utils.decorators import role_required
-from models.reservas_model import AreaComun, Reserva
+from models.reservas_model import AreaComun, Reserva, AreaRating
 from models.finanzas_model import PagoReserva
 from datetime import datetime, date, time
 from utils.email_utils import enviar_email_confirmacion_reserva
 
 reservas_bp = Blueprint('reservas', __name__)
 
+
+# ============================================================================
+# RUTAS PRINCIPALES
+# ============================================================================
+
 @reservas_bp.route('/reservas/', methods=['GET', 'POST'])
 @login_required
 def reservas():
     """
-    Vista para que los residentes hagan reservas
+    Vista principal de reservas para residentes (OPTIMIZADA PARA MÓVIL)
     """
     if request.method == 'POST':
         area_id = int(request.form.get('area_id'))
@@ -36,21 +45,26 @@ def reservas():
             
             # Validaciones
             if fecha_reserva < date.today():
-                flash('No puedes reservar fechas pasadas.', 'danger')
+                flash('❌ No puedes reservar fechas pasadas.', 'danger')
                 return redirect(url_for('reservas.reservas'))
             
             if hora_inicio >= hora_fin:
-                flash('La hora de inicio debe ser anterior a la hora de fin.', 'danger')
+                flash('❌ La hora de inicio debe ser anterior a la hora de fin.', 'danger')
                 return redirect(url_for('reservas.reservas'))
             
             # Verificar disponibilidad
             area = AreaComun.get_by_id(area_id)
             if not area:
-                flash('Área no encontrada.', 'danger')
+                flash('❌ Área no encontrada.', 'danger')
+                return redirect(url_for('reservas.reservas'))
+            
+            # Validar capacidad
+            if num_personas > area.capacidad:
+                flash(f'❌ El área tiene capacidad máxima de {area.capacidad} personas.', 'danger')
                 return redirect(url_for('reservas.reservas'))
             
             if not area.esta_disponible_en(fecha_reserva, hora_inicio, hora_fin):
-                flash('El área no está disponible en ese horario.', 'danger')
+                flash('❌ El área no está disponible en ese horario.', 'danger')
                 return redirect(url_for('reservas.reservas'))
             
             # Crear reserva
@@ -75,17 +89,17 @@ def reservas():
             )
             pago.save()
             
-            # Enviar email de confirmación (si está configurado)
+            # Enviar email de confirmación
             try:
                 enviar_email_confirmacion_reserva(reserva)
             except:
                 pass  # No fallar si el email no funciona
             
-            flash(f'Reserva creada exitosamente. Costo: Bs. {reserva.costo_total:.2f}', 'success')
+            flash(f'✅ Reserva creada exitosamente. Costo: Bs. {reserva.costo_total:.2f}', 'success')
             return redirect(url_for('reservas.reservas'))
             
         except ValueError as e:
-            flash(f'Error en los datos ingresados: {str(e)}', 'danger')
+            flash(f'❌ Error en los datos ingresados: {str(e)}', 'danger')
             return redirect(url_for('reservas.reservas'))
     
     # GET
@@ -109,24 +123,18 @@ def reservas_admin():
     """
     Vista de administración de todas las reservas
     """
-    # Filtros
     estado_filtro = request.args.get('estado', 'todas')
     area_filtro = request.args.get('area', 'todas')
     
-    # Obtener todas las reservas
     reservas = Reserva.get_all()
     
-    # Aplicar filtros
     if estado_filtro != 'todas':
         reservas = [r for r in reservas if r.estado == estado_filtro]
     
     if area_filtro != 'todas':
         reservas = [r for r in reservas if r.area_id == int(area_filtro)]
     
-    # Obtener áreas para el filtro
     areas = AreaComun.get_all()
-    
-    # Obtener reservas pendientes de confirmación
     reservas_pendientes = Reserva.get_pendientes()
     
     return render_template('reservas/reservas_admin.html',
@@ -137,6 +145,10 @@ def reservas_admin():
                          area_filtro=area_filtro)
 
 
+# ============================================================================
+# GESTIÓN DE RESERVAS
+# ============================================================================
+
 @reservas_bp.route('/eliminar_reserva/<int:reserva_id>/', methods=['POST'])
 @login_required
 def eliminar_reserva(reserva_id):
@@ -146,7 +158,7 @@ def eliminar_reserva(reserva_id):
     reserva = Reserva.get_by_id(reserva_id)
     
     if not reserva:
-        flash('Reserva no encontrada.', 'danger')
+        flash('❌ Reserva no encontrada.', 'danger')
         return redirect(url_for('reservas.reservas'))
     
     # Verificar permisos
@@ -156,14 +168,18 @@ def eliminar_reserva(reserva_id):
     )
     
     if not puede_eliminar:
-        flash('No tienes permiso para eliminar esta reserva.', 'danger')
+        flash('❌ No tienes permiso para cancelar esta reserva.', 'danger')
         return redirect(url_for('reservas.reservas'))
     
-    # Cancelar en lugar de eliminar
+    # Verificar si puede cancelar (24hrs antes)
+    if not reserva.puede_cancelar and not current_user.has_role('admin'):
+        flash('⚠️ Solo puedes cancelar con 24 horas de anticipación.', 'warning')
+        return redirect(url_for('reservas.reservas'))
+    
     motivo = request.form.get('motivo', 'Cancelada por el usuario')
     reserva.cancelar(motivo)
     
-    flash('Reserva cancelada exitosamente.', 'success')
+    flash('✅ Reserva cancelada exitosamente.', 'success')
     
     if current_user.has_role('admin'):
         return redirect(url_for('reservas.reservas_admin'))
@@ -180,7 +196,7 @@ def editar_reserva(reserva_id):
     reserva = Reserva.get_by_id(reserva_id)
     
     if not reserva:
-        flash('Reserva no encontrada.', 'danger')
+        flash('❌ Reserva no encontrada.', 'danger')
         return redirect(url_for('reservas.reservas'))
     
     # Verificar permisos
@@ -190,7 +206,7 @@ def editar_reserva(reserva_id):
     )
     
     if not puede_editar:
-        flash('No tienes permiso para editar esta reserva.', 'danger')
+        flash('❌ No tienes permiso para editar esta reserva.', 'danger')
         return redirect(url_for('reservas.reservas'))
     
     if request.method == 'POST':
@@ -198,12 +214,12 @@ def editar_reserva(reserva_id):
         
         if accion == 'confirmar':
             reserva.confirmar()
-            flash('Reserva confirmada.', 'success')
+            flash('✅ Reserva confirmada.', 'success')
         
         elif accion == 'cancelar':
             motivo = request.form.get('motivo', '')
             reserva.cancelar(motivo)
-            flash('Reserva cancelada.', 'success')
+            flash('✅ Reserva cancelada.', 'success')
         
         elif accion == 'actualizar':
             # Actualizar datos
@@ -225,7 +241,7 @@ def editar_reserva(reserva_id):
                     
                     area = AreaComun.get_by_id(reserva.area_id)
                     if not area.esta_disponible_en(nueva_fecha, nueva_hora_inicio, nueva_hora_fin):
-                        flash('El área no está disponible en el nuevo horario.', 'danger')
+                        flash('❌ El área no está disponible en el nuevo horario.', 'danger')
                         return redirect(url_for('reservas.editar_reserva', reserva_id=reserva_id))
                 
                 # Actualizar
@@ -237,9 +253,9 @@ def editar_reserva(reserva_id):
                 reserva.calcular_costo()
                 reserva.save()
                 
-                flash('Reserva actualizada exitosamente.', 'success')
+                flash('✅ Reserva actualizada exitosamente.', 'success')
             except ValueError as e:
-                flash(f'Error en los datos: {str(e)}', 'danger')
+                flash(f'❌ Error en los datos: {str(e)}', 'danger')
         
         if current_user.has_role('admin'):
             return redirect(url_for('reservas.reservas_admin'))
@@ -255,30 +271,171 @@ def editar_reserva(reserva_id):
                          fecha_minima=date.today().isoformat())
 
 
-@reservas_bp.route('/fechas_ocupadas/<int:area_id>/')
+# ============================================================================
+# CHECK-IN / CHECK-OUT
+# ============================================================================
+
+@reservas_bp.route('/check_in/<int:reserva_id>/', methods=['POST'])
+@login_required
+def check_in(reserva_id):
+    """
+    NUEVO: Realizar check-in de una reserva
+    """
+    reserva = Reserva.get_by_id(reserva_id)
+    
+    if not reserva:
+        return jsonify({'success': False, 'error': 'Reserva no encontrada'}), 404
+    
+    # Verificar permisos
+    if current_user.departamento != reserva.departamento and not current_user.has_role('admin'):
+        return jsonify({'success': False, 'error': 'Sin permiso'}), 403
+    
+    if reserva.hacer_check_in():
+        flash('✅ Check-in realizado exitosamente. ¡Disfruta del área!', 'success')
+        return jsonify({
+            'success': True,
+            'check_in': reserva.check_in.strftime('%H:%M')
+        })
+    else:
+        return jsonify({
+            'success': False,
+            'error': 'No puedes hacer check-in aún. Debe ser 15 minutos antes o después del horario.'
+        }), 400
+
+
+@reservas_bp.route('/check_out/<int:reserva_id>/', methods=['POST'])
+@login_required
+def check_out(reserva_id):
+    """
+    NUEVO: Realizar check-out de una reserva
+    """
+    reserva = Reserva.get_by_id(reserva_id)
+    
+    if not reserva:
+        return jsonify({'success': False, 'error': 'Reserva no encontrada'}), 404
+    
+    # Verificar permisos
+    if current_user.departamento != reserva.departamento and not current_user.has_role('admin'):
+        return jsonify({'success': False, 'error': 'Sin permiso'}), 403
+    
+    if reserva.hacer_check_out():
+        flash('✅ Check-out realizado. Gracias por usar nuestras instalaciones.', 'success')
+        return jsonify({
+            'success': True,
+            'check_out': reserva.check_out.strftime('%H:%M')
+        })
+    else:
+        return jsonify({
+            'success': False,
+            'error': 'No puedes hacer check-out. Debes haber hecho check-in primero.'
+        }), 400
+
+
+# ============================================================================
+# SISTEMA DE CALIFICACIONES
+# ============================================================================
+
+@reservas_bp.route('/calificar/<int:reserva_id>/', methods=['GET', 'POST'])
+@login_required
+def calificar_area(reserva_id):
+    """
+    NUEVO: Calificar un área después de usarla
+    """
+    reserva = Reserva.get_by_id(reserva_id)
+    
+    if not reserva:
+        flash('❌ Reserva no encontrada.', 'danger')
+        return redirect(url_for('reservas.reservas'))
+    
+    # Verificar permisos
+    if current_user.departamento != reserva.departamento:
+        flash('❌ No tienes permiso para calificar esta reserva.', 'danger')
+        return redirect(url_for('reservas.reservas'))
+    
+    # Verificar que esté completada
+    if reserva.estado != 'completada':
+        flash('⚠️ Solo puedes calificar reservas completadas.', 'warning')
+        return redirect(url_for('reservas.reservas'))
+    
+    # Verificar que no esté ya evaluada
+    if reserva.evaluada:
+        flash('ℹ️ Ya has calificado esta reserva.', 'info')
+        return redirect(url_for('reservas.reservas'))
+    
+    if request.method == 'POST':
+        rating = int(request.form.get('rating'))
+        comentario = request.form.get('comentario', '')
+        limpieza = int(request.form.get('limpieza', 0))
+        equipamiento = int(request.form.get('equipamiento', 0))
+        ubicacion = int(request.form.get('ubicacion', 0))
+        
+        # Validar rating
+        if rating < 1 or rating > 5:
+            flash('❌ La calificación debe estar entre 1 y 5 estrellas.', 'danger')
+            return redirect(url_for('reservas.calificar_area', reserva_id=reserva_id))
+        
+        # Crear rating
+        area_rating = AreaRating(
+            area_id=reserva.area_id,
+            reserva_id=reserva.id,
+            departamento=current_user.departamento,
+            rating=rating,
+            comentario=comentario,
+            limpieza=limpieza if limpieza > 0 else None,
+            equipamiento=equipamiento if equipamiento > 0 else None,
+            ubicacion=ubicacion if ubicacion > 0 else None
+        )
+        area_rating.save()
+        
+        flash('✅ ¡Gracias por tu calificación! Nos ayuda a mejorar.', 'success')
+        return redirect(url_for('reservas.reservas'))
+    
+    return render_template('reservas/calificar.html', reserva=reserva)
+
+
+@reservas_bp.route('/ratings/<int:area_id>/')
+@login_required
+def ver_ratings(area_id):
+    """
+    NUEVO: Ver calificaciones de un área
+    """
+    area = AreaComun.get_by_id(area_id)
+    
+    if not area:
+        flash('❌ Área no encontrada.', 'danger')
+        return redirect(url_for('reservas.reservas'))
+    
+    ratings = AreaRating.get_by_area(area_id)
+    
+    return render_template('reservas/ratings.html', 
+                         area=area,
+                         ratings=ratings)
+
+
+# ============================================================================
+# API ENDPOINTS (PARA MÓVIL)
+# ============================================================================
+
+@reservas_bp.route('/api/fechas_ocupadas/<int:area_id>/')
 @login_required
 def fechas_ocupadas(area_id):
     """
-    API para obtener fechas ocupadas de un área (para calendario)
+    API: Obtener fechas ocupadas de un área
     """
     mes = request.args.get('mes', type=int)
     anio = request.args.get('anio', type=int)
     
     fechas = Reserva.get_fechas_ocupadas(area_id, mes, anio)
-    
-    # Convertir a formato JSON serializable
     fechas_str = [f.isoformat() for f in fechas]
     
-    return jsonify({
-        'fechas': fechas_str
-    })
+    return jsonify({'fechas': fechas_str})
 
 
-@reservas_bp.route('/horarios_disponibles/<int:area_id>/')
+@reservas_bp.route('/api/horarios_disponibles/<int:area_id>/')
 @login_required
 def horarios_disponibles(area_id):
     """
-    API para obtener horarios disponibles de un área en una fecha
+    API: Obtener horarios disponibles de un área en una fecha
     """
     fecha_str = request.args.get('fecha')
     
@@ -292,10 +449,42 @@ def horarios_disponibles(area_id):
     
     horarios = Reserva.get_horarios_disponibles(area_id, fecha)
     
+    return jsonify({'horarios': horarios})
+
+
+@reservas_bp.route('/api/areas_populares/')
+@login_required
+def areas_populares():
+    """
+    NUEVO: API - Obtener áreas más populares
+    """
+    limit = request.args.get('limit', 5, type=int)
+    areas = AreaComun.get_mas_populares(limit)
+    
     return jsonify({
-        'horarios': horarios
+        'areas': [a.to_dict() for a in areas]
     })
 
+
+@reservas_bp.route('/api/mis_reservas/')
+@login_required
+def mis_reservas_api():
+    """
+    NUEVO: API - Obtener mis reservas
+    """
+    if not current_user.departamento:
+        return jsonify({'error': 'Sin departamento asignado'}), 400
+    
+    reservas = Reserva.get_proximas_by_departamento(current_user.departamento)
+    
+    return jsonify({
+        'reservas': [r.to_dict() for r in reservas]
+    })
+
+
+# ============================================================================
+# GESTIÓN DE ÁREAS (ADMIN)
+# ============================================================================
 
 @reservas_bp.route('/areas/', methods=['GET', 'POST'])
 @role_required('admin')
@@ -313,6 +502,12 @@ def gestionar_areas():
         tiempo_minimo = int(request.form.get('tiempo_minimo', 1))
         tiempo_maximo = int(request.form.get('tiempo_maximo', 8))
         
+        # NUEVO: Campos adicionales
+        requiere_deposito = request.form.get('requiere_deposito') == 'on'
+        monto_deposito = float(request.form.get('monto_deposito', 0))
+        equipamiento = request.form.get('equipamiento', '')
+        reglas = request.form.get('reglas', '')
+        
         try:
             hora_apertura = datetime.strptime(hora_apertura_str, '%H:%M').time()
             hora_cierre = datetime.strptime(hora_cierre_str, '%H:%M').time()
@@ -327,11 +522,16 @@ def gestionar_areas():
             )
             area.tiempo_minimo = tiempo_minimo
             area.tiempo_maximo = tiempo_maximo
+            area.requiere_deposito = requiere_deposito
+            area.monto_deposito = monto_deposito
+            area.equipamiento = equipamiento
+            area.reglas = reglas
+            
             area.save()
             
-            flash('Área creada exitosamente.', 'success')
+            flash('✅ Área creada exitosamente.', 'success')
         except Exception as e:
-            flash(f'Error al crear área: {str(e)}', 'danger')
+            flash(f'❌ Error al crear área: {str(e)}', 'danger')
         
         return redirect(url_for('reservas.gestionar_areas'))
     
@@ -350,7 +550,7 @@ def editar_area(area_id):
     area = AreaComun.get_by_id(area_id)
     
     if not area:
-        flash('Área no encontrada.', 'danger')
+        flash('❌ Área no encontrada.', 'danger')
         return redirect(url_for('reservas.gestionar_areas'))
     
     try:
@@ -362,11 +562,18 @@ def editar_area(area_id):
         area.hora_cierre = datetime.strptime(request.form.get('hora_cierre'), '%H:%M').time()
         area.tiempo_minimo = int(request.form.get('tiempo_minimo', 1))
         area.tiempo_maximo = int(request.form.get('tiempo_maximo', 8))
+        
+        # NUEVO: Actualizar campos adicionales
+        area.requiere_deposito = request.form.get('requiere_deposito') == 'on'
+        area.monto_deposito = float(request.form.get('monto_deposito', 0))
+        area.equipamiento = request.form.get('equipamiento', '')
+        area.reglas = request.form.get('reglas', '')
+        
         area.save()
         
-        flash('Área actualizada exitosamente.', 'success')
+        flash('✅ Área actualizada exitosamente.', 'success')
     except Exception as e:
-        flash(f'Error al actualizar área: {str(e)}', 'danger')
+        flash(f'❌ Error al actualizar área: {str(e)}', 'danger')
     
     return redirect(url_for('reservas.gestionar_areas'))
 
